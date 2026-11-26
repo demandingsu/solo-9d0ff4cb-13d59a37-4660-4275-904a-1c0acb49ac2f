@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import math
 import uuid
-from collections import Counter
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -895,8 +895,591 @@ def submit_score(
 
 
 # --------------------------------------------------------------------------- #
-# 整批更正：校验 / 方案 / 生效
+# 批量派卷（更正后重评，回避原评分教师）
 # --------------------------------------------------------------------------- #
+
+def _norm_teacher_id(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    tid = str(value).strip()
+    return tid or None
+
+
+def _dispatch_input_error(details: list[dict[str, Any]]) -> ServiceError:
+    return ServiceError(
+        422,
+        "DISPATCH_INVALID",
+        "批量派卷请求无效，整批未发出任何领题号",
+        details=details,
+    )
+
+
+def _normalize_dispatch_input(
+    papers: Any, teachers: Any
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """校验并归一化派卷请求（不访问数据库）。
+
+    papers   : [{paper_no, answer_id}, ...]，顺序即返回顺序
+    teachers : [{teacher_id, quota}, ...]，quota=本批最多可领份数
+    """
+    errors: list[dict[str, Any]] = []
+    norm_papers: list[dict[str, Any]] = []
+    seen_papers: set[str] = set()
+
+    if not isinstance(papers, list) or not papers:
+        errors.append({"code": "EMPTY_PAPERS", "message": "请提供待派卷 papers"})
+        papers = papers if isinstance(papers, list) else []
+
+    for idx, item in enumerate(papers):
+        if not isinstance(item, dict):
+            errors.append(
+                {"code": "INVALID_PAPER_ITEM", "index": idx, "message": "每卷必须是对象"}
+            )
+            continue
+        pno = str(item.get("paper_no") or "").strip()
+        aid = item.get("answer_id")
+        aid = str(aid).strip() if aid is not None else ""
+        if not pno:
+            errors.append(
+                {"code": "EMPTY_PAPER_NO", "index": idx, "message": "卷号不能为空"}
+            )
+        elif pno in seen_papers:
+            errors.append(
+                {
+                    "code": "DUPLICATE_PAPER_IN_BATCH",
+                    "paper_no": pno,
+                    "message": f"同一批次中卷 {pno} 出现了多次",
+                }
+            )
+        else:
+            seen_papers.add(pno)
+        if not aid:
+            errors.append(
+                {
+                    "code": "EMPTY_ANSWER_ID",
+                    "paper_no": pno or None,
+                    "index": idx,
+                    "message": "请提供每卷查到的答案编号 answer_id（用于核对卷是否已换答案）",
+                }
+            )
+        norm_papers.append({"paper_no": pno, "answer_id": aid})
+
+    norm_teachers: list[dict[str, Any]] = []
+    seen_teachers: set[str] = set()
+    if not isinstance(teachers, list) or not teachers:
+        errors.append({"code": "EMPTY_TEACHERS", "message": "请提供教师及本批名额 teachers"})
+        teachers = teachers if isinstance(teachers, list) else []
+
+    for idx, item in enumerate(teachers):
+        if not isinstance(item, dict):
+            errors.append(
+                {"code": "INVALID_TEACHER_ITEM", "index": idx, "message": "每位教师必须是对象"}
+            )
+            continue
+        tid = _norm_teacher_id(item.get("teacher_id"))
+        quota = item.get("quota")
+        if tid is None:
+            errors.append(
+                {"code": "EMPTY_TEACHER_ID", "index": idx, "message": "教师编号不能为空"}
+            )
+        elif tid in seen_teachers:
+            errors.append(
+                {
+                    "code": "DUPLICATE_TEACHER",
+                    "teacher_id": tid,
+                    "message": f"教师 {tid} 在本批教师名单中出现了多次",
+                }
+            )
+        else:
+            seen_teachers.add(tid)
+        if (
+            isinstance(quota, bool)
+            or not isinstance(quota, int)
+            or quota < 0
+        ):
+            errors.append(
+                {
+                    "code": "INVALID_QUOTA",
+                    "teacher_id": tid,
+                    "index": idx,
+                    "message": "每人本批名额必须是非负整数",
+                }
+            )
+            quota = 0
+        norm_teachers.append({"teacher_id": tid or "", "quota": quota})
+
+    if errors:
+        raise _dispatch_input_error(errors)
+    return norm_papers, norm_teachers
+
+
+class _Flow:
+    """小规模最大流（Dinic），用于“卷→教师”带名额的完备匹配判定。"""
+
+    __slots__ = ("n", "graph", "level", "it")
+
+    def __init__(self, n: int):
+        self.n = n
+        self.graph: list[list[list[int]]] = [[] for _ in range(n)]
+
+    def add_edge(self, u: int, v: int, cap: int) -> list[int]:
+        edge = [v, cap, len(self.graph[v])]
+        self.graph[u].append(edge)
+        self.graph[v].append([u, 0, len(self.graph[u]) - 1])
+        return edge
+
+    def _bfs(self, s: int, t: int) -> bool:
+        self.level = [-1] * self.n
+        self.level[s] = 0
+        dq = deque([s])
+        while dq:
+            u = dq.popleft()
+            for v, cap, _ in self.graph[u]:
+                if cap > 0 and self.level[v] < 0:
+                    self.level[v] = self.level[u] + 1
+                    dq.append(v)
+        return self.level[t] >= 0
+
+    def _dfs(self, u: int, t: int, f: int) -> int:
+        if u == t:
+            return f
+        edges = self.graph[u]
+        while self.it[u] < len(edges):
+            edge = edges[self.it[u]]
+            v, cap, rev = edge
+            if cap > 0 and self.level[v] == self.level[u] + 1:
+                pushed = self._dfs(v, t, min(f, cap))
+                if pushed > 0:
+                    edge[1] -= pushed
+                    self.graph[v][rev][1] += pushed
+                    return pushed
+            self.it[u] += 1
+        return 0
+
+    def max_flow(self, s: int, t: int) -> int:
+        total = 0
+        while self._bfs(s, t):
+            self.it = [0] * self.n
+            while True:
+                pushed = self._dfs(s, t, 10**9)
+                if pushed == 0:
+                    break
+                total += pushed
+        return total
+
+
+def _quota_assignment(
+    paper_order: list[str],
+    eligible: dict[str, list[str]],
+    quotas: dict[str, int],
+) -> tuple[dict[str, str], list[str]]:
+    """带名额的完备匹配；返回 (卷→教师, 未能分配的卷)。
+
+    以请求顺序建图，结果确定；若存在可行方案则一定找到。
+    """
+    paper_count = len(paper_order)
+    teacher_order = list(quotas)
+    t_index = {tid: i for i, tid in enumerate(teacher_order)}
+    source = 0
+    paper_base = 1
+    teacher_base = paper_base + paper_count
+    sink = teacher_base + len(teacher_order)
+
+    flow = _Flow(sink + 1)
+    paper_nodes: list[int] = []
+    for i, pno in enumerate(paper_order):
+        node = paper_base + i
+        paper_nodes.append(node)
+        flow.add_edge(source, node, 1)
+        for tid in eligible[pno]:
+            flow.add_edge(node, teacher_base + t_index[tid], 1)
+    for tid in teacher_order:
+        flow.add_edge(teacher_base + t_index[tid], sink, quotas[tid])
+
+    flow.max_flow(source, sink)
+
+    assignment: dict[str, str] = {}
+    unassigned: list[str] = []
+    for pno, node in zip(paper_order, paper_nodes):
+        chosen = None
+        for v, cap, _ in flow.graph[node]:
+            if teacher_base <= v < sink and cap == 0:
+                chosen = teacher_order[v - teacher_base]
+                break
+        if chosen is None:
+            unassigned.append(pno)
+        else:
+            assignment[pno] = chosen
+    return assignment, unassigned
+
+
+def _evaluate_dispatch_conn(
+    conn,
+    papers: list[dict[str, Any]],
+    teachers: list[dict[str, Any]],
+    ts: str,
+) -> dict[str, Any]:
+    """在单个事务内判定派卷并（可行时）一次性建好全部领题号。"""
+    reasons: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+
+    for item in papers:
+        pno, provided_aid = item["paper_no"], item["answer_id"]
+        paper_row = conn.execute(
+            "SELECT * FROM paper WHERE paper_no=?", (pno,)
+        ).fetchone()
+        if paper_row is None:
+            reasons.append(
+                {
+                    "code": "PAPER_NOT_FOUND",
+                    "paper_no": pno,
+                    "message": f"找不到卷号 {pno}",
+                }
+            )
+            continue
+
+        answer = conn.execute(
+            "SELECT * FROM answer WHERE status='active' AND current_paper_no=?",
+            (pno,),
+        ).fetchone()
+        blocks = parse_seq(answer["seq_json"]) if answer else []
+        if answer is None or not blocks:
+            reasons.append(
+                {
+                    "code": "PAPER_HAS_NO_ANSWER",
+                    "paper_no": pno,
+                    "message": f"卷 {pno} 当前没有可派的答案",
+                }
+            )
+            continue
+        if answer["id"] != provided_aid:
+            reasons.append(
+                {
+                    "code": "ANSWER_CHANGED",
+                    "paper_no": pno,
+                    "expected_answer_id": answer["id"],
+                    "provided_answer_id": provided_aid,
+                    "message": (
+                        f"卷 {pno} 当前答案是 {answer['id']}，与提交的 {provided_aid} 不一致"
+                        "（可能已换答案），请重新查询后再派"
+                    ),
+                }
+            )
+            continue
+
+        # 已评分的答案优先报“已评分”；未交分的有效领取报“已被领取”。
+        valid_score = conn.execute(
+            "SELECT id FROM score WHERE answer_id=? AND status='valid' LIMIT 1",
+            (answer["id"],),
+        ).fetchone()
+        if valid_score is not None:
+            reasons.append(
+                {
+                    "code": "ANSWER_ALREADY_SCORED",
+                    "paper_no": pno,
+                    "message": f"卷 {pno} 的答案已有有效评分，不属于待评答案",
+                }
+            )
+            continue
+
+        live_claim = conn.execute(
+            """
+            SELECT claim_no, teacher_id FROM claim
+            WHERE answer_id=? AND status IN ('active','submitted')
+            ORDER BY claim_no DESC LIMIT 1
+            """,
+            (answer["id"],),
+        ).fetchone()
+        if live_claim is not None:
+            reasons.append(
+                {
+                    "code": "ANSWER_ALREADY_CLAIMED",
+                    "paper_no": pno,
+                    "claim_no": live_claim["claim_no"],
+                    "teacher_id": live_claim["teacher_id"],
+                    "message": f"卷 {pno} 的答案已被领取（领题号 {live_claim['claim_no']}），不能重复派发",
+                }
+            )
+            continue
+
+        candidates.append(
+            {
+                "paper_no": pno,
+                "answer_id": answer["id"],
+                "blocks": blocks,
+            }
+        )
+
+    if reasons:
+        return _finish_dispatch_conn(
+            conn, papers, teachers, ts, status="rejected", reasons=reasons
+        )
+
+    batch_blocks = {b for c in candidates for b in c["blocks"]}
+
+    # 历史“已评分答案”：不论旧分是否已作废、答卷是否被拆拼过，都算。
+    # 只要某个答案曾被交过分，且它的扫描块里出现任一当前扫描块，就是相关旧分。
+    scored_answer_ids = {
+        r["answer_id"] for r in conn.execute("SELECT DISTINCT answer_id FROM score")
+    }
+    scored_answers: list[tuple[str, list[str]]] = []
+    for row in conn.execute("SELECT id, seq_json FROM answer"):
+        if row["id"] in scored_answer_ids:
+            blocks = parse_seq(row["seq_json"])
+            if batch_blocks.intersection(blocks):
+                scored_answers.append((row["id"], blocks))
+
+    scored_blocks: set[str] = {b for _, blocks in scored_answers for b in blocks}
+    # 只派“其中至少一块曾出现在已评分答案里”的待评答案：
+    # 每卷当前答案都必须有至少一块是历史评分过的扫描块，否则整批退回。
+    for cand in candidates:
+        if not scored_blocks.intersection(cand["blocks"]):
+            reasons.append(
+                {
+                    "code": "NO_SCORED_HISTORY",
+                    "paper_no": cand["paper_no"],
+                    "message": (
+                        f"卷 {cand['paper_no']} 的答案没有任何扫描块出现在已评分答案中，"
+                        "不属于更正后需重评的批次"
+                    ),
+                }
+            )
+    if reasons:
+        return _finish_dispatch_conn(
+            conn, papers, teachers, ts, status="rejected", reasons=reasons
+        )
+
+    # 相关旧分必须都能追溯到教师编号，否则无法判断回避 —— 整批退回。
+    score_rows: list[Any] = []
+    if scored_answers:
+        relevant_ids = sorted(aid for aid, _ in scored_answers)
+        placeholders = ",".join("?" for _ in relevant_ids)
+        score_rows = conn.execute(
+            f"""
+            SELECT s.id AS score_id, s.claim_no, s.answer_id,
+                   s.status AS score_status, c.teacher_id
+            FROM score s
+            JOIN claim c ON c.claim_no = s.claim_no
+            WHERE s.answer_id IN ({placeholders})
+            ORDER BY s.id
+            """,
+            relevant_ids,
+        ).fetchall()
+
+    missing_teacher = [
+        {
+            "code": "MISSING_TEACHER_ON_OLD_SCORE",
+            "score_id": r["score_id"],
+            "claim_no": r["claim_no"],
+            "answer_id": r["answer_id"],
+            "message": f"相关旧分（领题号 {r['claim_no']}）缺少教师编号，无法判断回避",
+        }
+        for r in score_rows
+        if not _norm_teacher_id(r["teacher_id"])
+    ]
+    if missing_teacher:
+        reasons.extend(missing_teacher)
+        return _finish_dispatch_conn(
+            conn, papers, teachers, ts, status="rejected", reasons=reasons
+        )
+
+    # 回避名单按整批计算：凡给“含本批任一当前扫描块”的答案打过分的教师，
+    # 都要回避本批全部卷（哪怕那笔旧分已作废、或那答案后来被拆拼多次）。
+    blocks_by_answer = dict(scored_answers)
+    scored_by_answer: dict[str, set[str]] = defaultdict(set)
+    for r in score_rows:
+        tid = _norm_teacher_id(r["teacher_id"])
+        if tid is not None:
+            scored_by_answer[r["answer_id"]].add(tid)
+
+    all_recused: set[str] = set()
+    for aid, blocks in blocks_by_answer.items():
+        if batch_blocks.intersection(blocks):
+            all_recused |= scored_by_answer.get(aid, set())
+    recused_teachers = sorted(all_recused)
+
+    quotas = {t["teacher_id"]: t["quota"] for t in teachers if t["quota"] > 0}
+    paper_order = [c["paper_no"] for c in candidates]
+    eligible: dict[str, list[str]] = {
+        c["paper_no"]: [
+            t["teacher_id"]
+            for t in teachers
+            if t["quota"] > 0 and t["teacher_id"] not in all_recused
+        ]
+        for c in candidates
+    }
+    assignment, unassigned = _quota_assignment(paper_order, eligible, quotas)
+    if unassigned:
+        reasons.append(
+            {
+                "code": "DISPATCH_UNFILLABLE",
+                "unassigned_papers": unassigned,
+                "recused_teachers": recused_teachers,
+                "message": (
+                    "在回避原评分教师和每人名额限制下无法把整批卷派齐，"
+                    "请增加教师或名额后重试"
+                ),
+            }
+        )
+        return _finish_dispatch_conn(
+            conn, papers, teachers, ts, status="rejected", reasons=reasons
+        )
+
+    # 可行：一次性建好全部领题号，教师照常凭号交分。
+    cur = conn.execute(
+        "INSERT INTO dispatch(status, request_json, created_at) VALUES ('issued', ?, ?)",
+        (json.dumps({"papers": papers, "teachers": teachers}, ensure_ascii=False), ts),
+    )
+    dispatch_id = cur.lastrowid
+
+    by_paper = {c["paper_no"]: c for c in candidates}
+    issued = []
+    per_teacher: dict[str, list[int]] = defaultdict(list)
+    for seq_no, pno in enumerate(paper_order, start=1):
+        cand = by_paper[pno]
+        tid = assignment[pno]
+        claim_cur = conn.execute(
+            """
+            INSERT INTO claim(answer_id, teacher_id, status, created_at)
+            VALUES (?, ?, 'active', ?)
+            """,
+            (cand["answer_id"], tid, ts),
+        )
+        claim_no = claim_cur.lastrowid
+        conn.execute(
+            """
+            INSERT INTO dispatch_item(dispatch_id, seq_no, paper_no, answer_id,
+                                      seq_json, teacher_id, claim_no)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                dispatch_id,
+                seq_no,
+                pno,
+                cand["answer_id"],
+                json.dumps(cand["blocks"], ensure_ascii=False),
+                tid,
+                claim_no,
+            ),
+        )
+        per_teacher[tid].append(claim_no)
+        issued.append(
+            {
+                "paper_no": pno,
+                "answer_id": cand["answer_id"],
+                "blocks": cand["blocks"],
+                "teacher_id": tid,
+                "claim_no": claim_no,
+            }
+        )
+
+    payload = {
+        "dispatch_id": dispatch_id,
+        "status": "issued",
+        "question_id": QUESTION_ID,
+        "paper_count": len(issued),
+        "papers": issued,
+        "teachers": [
+            {
+                "teacher_id": t["teacher_id"],
+                "quota": t["quota"],
+                "assigned": len(per_teacher.get(t["teacher_id"], [])),
+                "claim_nos": per_teacher.get(t["teacher_id"], []),
+            }
+            for t in teachers
+        ],
+        "recused_teachers": recused_teachers,
+        "issued_at": ts,
+    }
+    conn.execute(
+        "UPDATE dispatch SET result_json=? WHERE id=?",
+        (json.dumps(payload, ensure_ascii=False), dispatch_id),
+    )
+    return payload
+
+
+def _finish_dispatch_conn(
+    conn,
+    papers: list[dict[str, Any]],
+    teachers: list[dict[str, Any]],
+    ts: str,
+    *,
+    status: str,
+    reasons: list[dict[str, Any]],
+) -> dict[str, Any]:
+    cur = conn.execute(
+        "INSERT INTO dispatch(status, request_json, created_at) VALUES (?, ?, ?)",
+        (
+            status,
+            json.dumps({"papers": papers, "teachers": teachers}, ensure_ascii=False),
+            ts,
+        ),
+    )
+    dispatch_id = cur.lastrowid
+    payload = {
+        "dispatch_id": dispatch_id,
+        "status": status,
+        "question_id": QUESTION_ID,
+        "paper_count": 0,
+        "papers": [],
+        "teachers": [],
+        "reasons": reasons,
+        "issued_at": None,
+        "created_at": ts,
+    }
+    conn.execute(
+        "UPDATE dispatch SET result_json=? WHERE id=?",
+        (json.dumps(payload, ensure_ascii=False), dispatch_id),
+    )
+    return payload
+
+
+def create_dispatch(
+    db: Database, papers: Any, teachers: Any
+) -> dict[str, Any]:
+    norm_papers, norm_teachers = _normalize_dispatch_input(papers, teachers)
+    ts = now_iso()
+    with db.tx() as conn:
+        result = _evaluate_dispatch_conn(conn, norm_papers, norm_teachers, ts)
+    if result["status"] != "issued":
+        raise ServiceError(
+            409,
+            "DISPATCH_REJECTED",
+            "整批派卷未通过核对，未发出任何领题号",
+            details=result,
+        )
+    return result
+
+
+def _dispatch_row_to_dict(row) -> dict[str, Any]:
+    data = {
+        "dispatch_id": row["id"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "request": json.loads(row["request_json"]) if row["request_json"] else None,
+    }
+    if row["result_json"]:
+        data["result"] = json.loads(row["result_json"])
+    return data
+
+
+def get_dispatch(db: Database, dispatch_id: int) -> dict[str, Any]:
+    with db.read() as conn:
+        row = conn.execute(
+            "SELECT * FROM dispatch WHERE id=?", (dispatch_id,)
+        ).fetchone()
+        if row is None:
+            raise ServiceError(
+                404, "DISPATCH_NOT_FOUND", f"找不到派卷单 {dispatch_id}"
+            )
+        return _dispatch_row_to_dict(row)
+
+
+def list_dispatches(db: Database) -> list[dict[str, Any]]:
+    with db.read() as conn:
+        rows = conn.execute("SELECT * FROM dispatch ORDER BY id DESC").fetchall()
+        return [_dispatch_row_to_dict(r) for r in rows]
+
 
 def _validate_batch_conn(conn, assignments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     errors: list[dict[str, Any]] = []

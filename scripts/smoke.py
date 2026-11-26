@@ -208,6 +208,124 @@ def main() -> int:
     s, ov = call("GET", "/overview")
     check("总览可查询且块全部归卷", s == 200 and ov["unassigned_blocks"] == [])
 
+    # 11) 更正后批量派卷：回避原评分教师、按名额一次派齐
+    call("POST", "/admin/reset?confirm=true")
+    call("POST", "/blocks", {"blocks": ["S1", "S2", "S3"]})
+    call("PUT", "/papers/R1/blocks", {"blocks": ["S1", "S2", "S3"]})
+    _, old_claim = call("POST", "/claims", {"teacher_id": "T-OLD"})
+    call("POST", f"/claims/{old_claim['claim_no']}/score", {"score": 80, "comment": "旧评"})
+    s, _ = call(
+        "POST",
+        "/corrections",
+        {
+            "assignments": [
+                {"paper_no": "R1", "blocks": ["S1", "S2"]},
+                {"paper_no": "R2", "blocks": ["S3"]},
+            ]
+        },
+    )
+    check("拆分后进入重评", s == 200)
+
+    _, r1 = call("GET", "/papers/R1")
+    _, r2 = call("GET", "/papers/R2")
+    refs = [
+        {"paper_no": "R1", "answer_id": r1["answer_id"]},
+        {"paper_no": "R2", "answer_id": r2["answer_id"]},
+    ]
+    s, rejected = call(
+        "POST", "/dispatches",
+        {"papers": refs, "teachers": [{"teacher_id": "T-OLD", "quota": 2}]},
+        expect=409,
+    )
+    check(
+        "原评分教师被回避且整批分不齐 -> 409 不发号",
+        s == 409 and rejected["detail"]["code"] == "DISPATCH_REJECTED"
+        and rejected["detail"]["details"]["papers"] == [],
+        str(rejected)[:300],
+    )
+    _, r1_after = call("GET", "/papers/R1")
+    check("退回后两卷仍无人领取", r1_after["grading_status"] == "unclaimed")
+
+    # 名额不够：两名教师各 1 个名额但 T-NEW2 给了 0 -> 只够派 1 卷 -> 整批退回
+    s, short = call(
+        "POST", "/dispatches",
+        {
+            "papers": refs,
+            "teachers": [
+                {"teacher_id": "T-NEW", "quota": 1},
+                {"teacher_id": "T-NEW2", "quota": 0},
+            ],
+        },
+        expect=409,
+    )
+    check(
+        "名额不足整批退回并指出未派的卷",
+        s == 409
+        and short["detail"]["details"]["reasons"][0]["code"] == "DISPATCH_UNFILLABLE"
+        and short["detail"]["details"]["reasons"][0]["unassigned_papers"] == ["R2"],
+        str(short)[:300],
+    )
+
+    s, issued = call(
+        "POST", "/dispatches",
+        {
+            "papers": refs,
+            "teachers": [
+                {"teacher_id": "T-OLD", "quota": 5},
+                {"teacher_id": "T-NEW", "quota": 1},
+                {"teacher_id": "T-NEW2", "quota": 1},
+            ],
+        },
+    )
+    check("可行时一次派齐", s == 200 and issued["status"] == "issued", str(issued)[:300])
+    check(
+        "派号里没有原评分教师",
+        all(p["teacher_id"] != "T-OLD" for p in issued["papers"]),
+    )
+    teacher_of = {p["paper_no"]: p["teacher_id"] for p in issued["papers"]}
+    claim_of = {p["paper_no"]: p["claim_no"] for p in issued["papers"]}
+    check(
+        "按名额分配：两名新教师各得一卷",
+        sorted(teacher_of.values()) == ["T-NEW", "T-NEW2"],
+        str(teacher_of),
+    )
+
+    # 教师照常凭派到的领题号交分
+    s, _ = call("POST", f"/claims/{claim_of['R1']}/score", {"score": 85})
+    check("派到的领题号可正常交分", s == 200)
+    _, r1_scored = call("GET", "/papers/R1")
+    check("按卷查到派卷后的评分", r1_scored["score"] == 85)
+
+    # 已领走的卷再次派发 -> 整批退回
+    s, again = call(
+        "POST", "/dispatches",
+        {"papers": refs, "teachers": [{"teacher_id": "T-X", "quota": 2}]},
+        expect=409,
+    )
+    check(
+        "已领走的答案不能再派",
+        s == 409
+        and any(r["code"] == "ANSWER_ALREADY_CLAIMED" for r in again["detail"]["details"]["reasons"]),
+        str(again)[:300],
+    )
+
+    # 卷已换答案 -> 退回
+    _, r1_now = call("GET", "/papers/R1")
+    stale_refs = [{"paper_no": "R1", "answer_id": "A-STALE"}, {"paper_no": "R2", "answer_id": r1_now["answer_id"]}]
+    s, stale = call(
+        "POST", "/dispatches",
+        {"papers": stale_refs, "teachers": [{"teacher_id": "T-Y", "quota": 2}]},
+        expect=409,
+    )
+    check(
+        "答案编号不符（卷已换答案）-> 退回",
+        s == 409 and any(r["code"] == "ANSWER_CHANGED" for r in stale["detail"]["details"]["reasons"]),
+        str(stale)[:300],
+    )
+
+    s, dl = call("GET", "/dispatches")
+    check("派卷单可查询", s == 200 and len(dl["dispatches"]) >= 4)
+
     print(f"\n通过 {checks - len(failures)} 项检查，失败 {len(failures)} 项。")
     if failures:
         print("失败明细：")

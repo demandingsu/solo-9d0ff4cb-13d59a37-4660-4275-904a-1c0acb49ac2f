@@ -74,6 +74,28 @@ CREATE TABLE IF NOT EXISTS claim (
 );
 CREATE INDEX IF NOT EXISTS idx_claim_answer ON claim(answer_id);
 
+-- 批量派卷单：整批要么全部派号（issued），要么整批不发号（rejected）。
+CREATE TABLE IF NOT EXISTS dispatch (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    status       TEXT NOT NULL, -- issued | rejected
+    request_json TEXT NOT NULL,
+    result_json  TEXT,
+    created_at   TEXT NOT NULL
+);
+
+-- 派卷明细：一行 = 一次派发（一卷 -> 一位教师 -> 一个领题号）。
+CREATE TABLE IF NOT EXISTS dispatch_item (
+    dispatch_id INTEGER NOT NULL REFERENCES dispatch(id),
+    seq_no      INTEGER NOT NULL,
+    paper_no    TEXT NOT NULL,
+    answer_id   TEXT NOT NULL REFERENCES answer(id),
+    seq_json    TEXT NOT NULL,
+    teacher_id  TEXT NOT NULL,
+    claim_no    INTEGER REFERENCES claim(claim_no),
+    PRIMARY KEY (dispatch_id, seq_no)
+);
+CREATE INDEX IF NOT EXISTS idx_dispatch_item_claim ON dispatch_item(claim_no);
+
 -- 评分流水：同一领题号重新交分以 superseded 保留旧记录，
 -- 更正作废时相关 valid 记录置 void，绝不物理删除“已入账评分”。
 CREATE TABLE IF NOT EXISTS score (

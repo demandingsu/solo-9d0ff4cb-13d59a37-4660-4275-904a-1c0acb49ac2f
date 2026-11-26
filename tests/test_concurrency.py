@@ -145,3 +145,97 @@ def test_concurrent_corrections_and_scoring_keep_invariants(tmp_path):
     # 最终再提交一次更正必须成功（服务仍可用）
     result = apply_correction(db_a, layout_intact)
     assert result["status"] == "applied"
+
+
+def test_dispatch_and_normal_claims_are_atomic(tmp_path):
+    """派卷与普通领取并发：任一卷只能被一方拿到，不出现重复领题号。"""
+    from app.service import create_dispatch
+
+    db_a = _seed(str(tmp_path / "c3.db"))
+    db_b = Database(str(tmp_path / "c3.db"))
+
+    # 先给 P1 一个历史评分，使其符合“更正后重评”的派卷条件
+    cno = create_claim(db_a, "T-OLD", None)["claim_no"]
+    submit_score(db_a, cno, 80, None)
+    apply_correction(
+        db_a,
+        [
+            {"paper_no": "P1", "blocks": ["B1"]},
+            {"paper_no": "P0", "blocks": ["B2"]},
+            {"paper_no": "P2", "blocks": ["B3", "B4"]},
+        ],
+    )
+    with db_a.read() as conn:
+        refs = [
+            {"paper_no": r["current_paper_no"], "answer_id": r["id"]}
+            for r in conn.execute(
+                "SELECT id, current_paper_no FROM answer WHERE status='active'"
+            )
+        ]
+    refs = [r for r in refs if r["paper_no"] in ("P1", "P0")]
+
+    outcomes: Counter = Counter()
+    unexpected: list[Exception] = []
+    lock = threading.Lock()
+
+    def dispatch_worker():
+        try:
+            body = create_dispatch(
+                db_b, refs, [{"teacher_id": "T-NEW", "quota": len(refs)}]
+            )
+            with lock:
+                outcomes["dispatch_issued"] += body["paper_count"]
+        except ServiceError as e:
+            if e.code in ("DISPATCH_REJECTED", "DISPATCH_INVALID"):
+                with lock:
+                    outcomes["dispatch_rejected"] += 1
+            else:
+                unexpected.append(e)
+        except Exception as e:  # noqa: BLE001
+            unexpected.append(e)
+
+    def plain_claim_worker():
+        for _ in range(6):
+            try:
+                claim = create_claim(db_a, "T-PLAIN", None)
+                with lock:
+                    outcomes["plain_claim_ok"] += 1
+            except ServiceError as e:
+                if e.code in ("NO_CLAIMABLE_ANSWER", "ANSWER_NOT_CLAIMABLE"):
+                    with lock:
+                        outcomes["plain_empty"] += 1
+                    return
+                unexpected.append(e)
+            except Exception as e:  # noqa: BLE001
+                unexpected.append(e)
+
+    threads = [threading.Thread(target=dispatch_worker) for _ in range(3)]
+    threads += [threading.Thread(target=plain_claim_worker) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not unexpected, unexpected[:3]
+
+    # 不变量：每个答案至多一个有效领题号（active/submitted），派号与普通领取不重复
+    with db_a.read() as conn:
+        duplicates = conn.execute(
+            """
+            SELECT answer_id, COUNT(*) c FROM claim
+            WHERE status IN ('active','submitted')
+            GROUP BY answer_id HAVING c > 1
+            """
+        ).fetchall()
+        assert not duplicates
+        total_live = conn.execute(
+            "SELECT COUNT(*) n FROM claim WHERE status IN ('active','submitted')"
+        ).fetchone()["n"]
+        answer_count = conn.execute(
+            "SELECT COUNT(*) n FROM answer WHERE status='active' AND seq_key<>'[]'"
+        ).fetchone()["n"]
+        assert total_live <= answer_count
+        issued_items = conn.execute(
+            "SELECT COUNT(*) n FROM dispatch_item"
+        ).fetchone()["n"]
+        assert issued_items == outcomes["dispatch_issued"]

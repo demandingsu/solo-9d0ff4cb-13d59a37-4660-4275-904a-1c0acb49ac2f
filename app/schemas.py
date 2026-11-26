@@ -313,3 +313,119 @@ class ScoreSubmitRequest(ScoreBody):
 class QuestionUpdateRequest(BaseModel):
     name: Optional[str] = Field(None, examples=["高二数学 第18题"])
     full_score: Optional[float] = Field(None, examples=[12.0])
+
+
+class DispatchPaperItem(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    paper_no: str = Field(..., examples=["P001"])
+    answer_id: Optional[str] = Field(
+        None,
+        description="派卷前按卷号查到的当前答案编号（GET /papers/{卷号} 的 answer_id）",
+        examples=["A-1a2b3c4d5e6f"],
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            out = dict(data)
+            if "paper_no" not in out:
+                pn = pick_key(out, _PAPER_KEYS)
+                if pn is not None:
+                    out["paper_no"] = str(pn).strip()
+            elif out.get("paper_no") is not None:
+                out["paper_no"] = str(out["paper_no"]).strip()
+            if "answer_id" not in out:
+                aid = pick_key(
+                    out, ("answer_id", "answerId", "answer_no", "答案编号", "答案号")
+                )
+                if aid is not None:
+                    out["answer_id"] = str(aid).strip()
+            return out
+        if isinstance(data, list) and len(data) == 2:
+            # 兼容 [卷号, 答案编号] 的二元组写法
+            return {"paper_no": str(data[0]).strip(), "answer_id": str(data[1]).strip()}
+        return data
+
+
+class DispatchTeacherItem(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    teacher_id: str = Field(..., examples=["T007"])
+    quota: Optional[int] = Field(
+        None,
+        description="该教师在本批最多可领的份数（0 表示本批不参与）",
+        examples=[3],
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            out = dict(data)
+            if "teacher_id" not in out:
+                tid = pick_key(
+                    out, ("teacher_id", "teacherId", "teacher", "teacher_no", "工号", "教师编号")
+                )
+                if tid is not None:
+                    out["teacher_id"] = str(tid).strip()
+            elif out.get("teacher_id") is not None:
+                out["teacher_id"] = str(out["teacher_id"]).strip()
+            if "quota" not in out:
+                q = pick_key(
+                    out, ("quota", "limit", "max", "capacity", "名额", "本批名额")
+                )
+                if q is not None:
+                    out["quota"] = q
+            return out
+        if isinstance(data, list) and len(data) == 2:
+            # 兼容 [教师编号, 名额] 的二元组写法
+            return {"teacher_id": str(data[0]).strip(), "quota": data[1]}
+        return data
+
+
+class DispatchRequest(BaseModel):
+    model_config = ConfigDict(
+        extra="allow",
+        json_schema_extra={
+            "example": {
+                "papers": [
+                    {"paper_no": "P001", "answer_id": "A-1a2b3c4d5e6f"},
+                    {"paper_no": "P002", "answer_id": "A-7f8e9d0c1b2a"},
+                ],
+                "teachers": [
+                    {"teacher_id": "T007", "quota": 1},
+                    {"teacher_id": "T008", "quota": 1},
+                ],
+            }
+        },
+    )
+
+    papers: Optional[list[DispatchPaperItem]] = Field(
+        None,
+        description="待派卷：每卷的卷号 paper_no 与查到的答案编号 answer_id",
+    )
+    teachers: Optional[list[DispatchTeacherItem]] = Field(
+        None,
+        description="参与本批的教师及每人本批名额 quota",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        if not out.get("papers"):
+            for k in ("items", "batch", "volumes", "卷"):
+                if isinstance(out.get(k), list):
+                    out["papers"] = out[k]
+                    break
+        if not out.get("teachers"):
+            for k in ("assignees", "markers", "教师"):
+                if isinstance(out.get(k), list):
+                    out["teachers"] = out[k]
+                    break
+        return out
+

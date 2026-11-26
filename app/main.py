@@ -20,6 +20,7 @@ from .schemas import (
     BlockRegisterRequest,
     ClaimRequest,
     CorrectionRequest,
+    DispatchRequest,
     PaperSequenceRequest,
     QuestionUpdateRequest,
     ScoreBody,
@@ -33,6 +34,7 @@ TAGS_METADATA = [
     {"name": "papers", "description": "按卷录入有序块串、按卷查得分/待评状态"},
     {"name": "claims", "description": "教师领取无卷号答案、凭领题号交分"},
     {"name": "corrections", "description": "教务员整批更正：核对、暂存、生效、查询"},
+    {"name": "dispatches", "description": "更正后批量派卷：回避原评分教师、按名额一次派齐"},
     {"name": "admin", "description": "管理/自测工具"},
 ]
 
@@ -309,6 +311,35 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     )
     def cancel_correction(correction_id: int):
         return service.cancel_staged_correction(db, correction_id)
+
+    # ---------------------------- dispatches ------------------------------- #
+    @app.post(
+        "/dispatches",
+        tags=["dispatches"],
+        summary="更正后批量派卷：回避原评分教师，按每人名额一次派齐",
+        description=(
+            "提交每卷的**卷号**与**查到的答案编号**（`GET /papers/{卷号}` 的 `answer_id`），"
+            "再提交参与的**教师编号**与**每人本批名额**。\n\n"
+            "- 只派**无人领取的待评答案**（已领取 / 已评分 / 无答案都整批拒绝）；\n"
+            "- 每卷至少有一块曾出现在**已评分答案**里（不论旧分是否作废、答卷是否被拆拼）；\n"
+            "- 曾给“含本批任一当前扫描块”的答案打过分的教师**全部回避**；\n"
+            "- 相关旧分若缺教师编号，无法判断回避 → **整批退回**；\n"
+            "- 只要在回避与名额限制下能派齐，就**一次发齐**并返回各卷的教师与领题号；\n"
+            "- 任一卷已换答案 / 被领走 / 整批分不齐 → 返回原因且**整批不发号**（409）。"
+        ),
+    )
+    def create_dispatch(body: DispatchRequest):
+        papers = [p.model_dump() for p in (body.papers or [])]
+        teachers = [t.model_dump() for t in (body.teachers or [])]
+        return service.create_dispatch(db, papers, teachers)
+
+    @app.get("/dispatches", tags=["dispatches"], summary="派卷单列表")
+    def list_dispatches():
+        return {"dispatches": service.list_dispatches(db)}
+
+    @app.get("/dispatches/{dispatch_id}", tags=["dispatches"], summary="派卷单详情/结果")
+    def get_dispatch(dispatch_id: int):
+        return service.get_dispatch(db, dispatch_id)
 
     # ------------------------------- admin --------------------------------- #
     @app.post(

@@ -36,6 +36,45 @@
   - `status=pending` + `grading_status=unclaimed|claimed`（待评/已领取待交分），或
   - `status=empty`（该卷当前没有答题块）。
 
+### 更正后的批量派卷（重评必须回避原评分教师）
+
+更正把一批卷拆成了需要重评的新答案后，教务用 `POST /dispatches` **一次派齐**：
+
+1. 提交每卷的**卷号**和派发前刚查到的**答案编号**（`GET /papers/{卷号}` 的 `answer_id`），
+   以及参与的**教师编号**和**每人本批名额**。
+2. 服务只派**无人领取的待评答案**：已领取待交分、已评分、或当前无答案的卷，整批退回。
+3. 每卷当前答案必须**至少有一块曾出现在已评分答案中**（旧分已作废、答卷被多次拆拼都照算），
+   否则该卷不属于“更正后重评”，整批退回。
+4. **回避**：凡是给“含本批任一当前扫描块”的答案打过分的教师，都不能出现在本批派号里。
+   相关旧分如果**缺少教师编号**（例如当年是匿名盲领），无法判断回避 → 整批退回。
+5. 在回避与名额限制下，只要**存在可行方案**就一次发齐，返回每卷的教师与领题号；
+   名额用满时按请求顺序确定性分配。
+6. 以下任一情形都返回 `409 DISPATCH_REJECTED`，**整批不发任何领题号**，并在
+   `detail.details.reasons[]` 给出逐项原因：卷号不存在 / 无答案 / 答案编号已变 /
+   被领取 / 已有有效评分 / 无评分历史 / 旧分缺教师编号 / 名额下分不齐。
+7. 派出的领题号与普通领取完全一致：教师在 `POST /claims` 之外无需额外操作，
+   直接 `POST /claims/{领题号}/score` 交分；领取响应照旧不含卷号。
+
+```bash
+# 例：更正后 R1=[S1,S2]、R2=[S3] 待评，原评分教师 T-OLD 必须回避
+curl $B/papers/R1        # 记下 answer_id
+curl $B/papers/R2
+curl -X POST $B/dispatches -H 'Content-Type: application/json' -d '{
+  "papers":[
+    {"paper_no":"R1","answer_id":"A-xxxx"},
+    {"paper_no":"R2","answer_id":"A-yyyy"}
+  ],
+  "teachers":[
+    {"teacher_id":"T-OLD","quota":5},
+    {"teacher_id":"T-NEW","quota":1},
+    {"teacher_id":"T-NEW2","quota":1}
+  ]
+}'
+# -> status=issued，papers[] 每项 {paper_no, teacher_id, claim_no}，teachers[] 为每人名额/已派/领题号
+```
+
+整批成败都留一张派卷单：`GET /dispatches` 列表、`GET /dispatches/{id}` 详情。
+
 ---
 
 ## 2. Docker Compose 启动（推荐）
@@ -72,13 +111,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 # 打开 http://127.0.0.1:8000/docs
 ```
 
-跑单元/集成测试（36 个用例，含并发与回滚）：
+跑单元/集成测试（48 个用例，含并发、回滚与派卷）：
 
 ```bash
 python -m pytest tests/ -q
 ```
 
-对一个已经跑起来的服务做 70 项端到端 HTTP 冒烟（仅用标准库）：
+对一个已经跑起来的服务做 100 项端到端 HTTP 冒烟（仅用标准库）：
 
 ```bash
 python scripts/smoke.py                 # 默认 http://127.0.0.1:8000
@@ -173,6 +212,8 @@ curl -X POST $B/claims/1/score -H 'Content-Type: application/json' -d '{"score":
 | `POST /corrections` | 提交整批更正：`mode=apply`（默认）/ `stage` / `verify` |
 | `GET /corrections` / `GET /corrections/{id}` | 更正单列表 / 详情方案 |
 | `POST /corrections/{id}/apply` / `.../cancel` | 暂存单生效（幂等）/ 取消 |
+| `POST /dispatches` | 更正后批量派卷：回避原评分教师、按名额一次派齐（不可行整批不发号） |
+| `GET /dispatches` / `GET /dispatches/{id}` | 派卷单列表 / 详情（含逐项退回原因） |
 | `POST /admin/seed-demo` / `POST /admin/reset?confirm=true` | 演示数据 / 清空自测数据 |
 
 请求体兼容常见别名与多种形态，例如更正批次也支持
@@ -183,6 +224,12 @@ curl -X POST $B/claims/1/score -H 'Content-Type: application/json' -d '{"score":
 
 - `422 CORRECTION_INVALID`：整批更正未通过（`details[].code` 可能是
   `UNKNOWN_BLOCK` / `DUPLICATE_BLOCK` / `MISSING_BLOCKS` / `DUPLICATE_PAPER_IN_BATCH` 等）。
+- `422 DISPATCH_INVALID`：派卷请求字段不合法（空批次、缺 answer_id/教师/名额、名额为负、
+  同批重复卷/教师等），未发任何领题号。
+- `409 DISPATCH_REJECTED`：整批派卷核对未通过（`detail.details.reasons[]` 逐项说明：
+  `PAPER_NOT_FOUND` / `PAPER_HAS_NO_ANSWER` / `ANSWER_CHANGED` / `ANSWER_ALREADY_CLAIMED` /
+  `ANSWER_ALREADY_SCORED` / `NO_SCORED_HISTORY` / `MISSING_TEACHER_ON_OLD_SCORE` /
+  `DISPATCH_UNFILLABLE`），**整批不发号**。
 - `409 CLAIM_VOID`：领题号已因拆拼/调序作废。
 - `409 CLAIM_RELEASED` / `409 NO_CLAIMABLE_ANSWER` / `409 BLOCK_ASSIGNED_TO_OTHER_PAPER`。
 - `404 PAPER_NOT_FOUND` / `404 CLAIM_NOT_FOUND` / `404 CORRECTION_NOT_FOUND`。
@@ -210,8 +257,8 @@ app/
   service.py    # 领域逻辑：答案身份、继承/作废、更正事务、交分
   db.py         # SQLite 连接、schema、串行写事务、轻量迁移
   schemas.py    # Pydantic 模型与宽松入参兼容
-tests/          # 36 个 pytest 用例（规则/回滚/暂存/并发）
-scripts/smoke.py# 70 项标准库端到端冒烟
+tests/          # 48 个 pytest 用例（规则/回滚/暂存/并发/派卷）
+scripts/smoke.py# 100 项标准库端到端冒烟
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt
